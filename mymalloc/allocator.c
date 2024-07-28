@@ -45,17 +45,15 @@
 // The smallest aligned size that will hold a size_t value.
 #define SIZE_T_SIZE (ALIGN(sizeof(size_t)))
 
-// The smallest aligned size that will hold a unsigned int value.
-#define UINT_SIZE (ALIGN(sizeof(unsigned int)))
+#define HEADER_SIZE (ALIGN(2 * SIZE_T_SIZE))
 
-#define HEADER_SIZE (ALIGN(SIZE_T_SIZE + UINT_SIZE))
+#define BIN_SIZE(idx) (ALIGN((1 << (idx + 4))))
 
-#define BLOCK_SIZE(idx) ALIGN((1 << (idx + 3)))
+#define BLOCK_SIZE(idx) (ALIGN((BIN_SIZE(idx) - HEADER_SIZE)))
 
-// The bin size including header
-#define BIN_SIZE(idx) ALIGN((BLOCK_SIZE(idx) + HEADER_SIZE))
+#define BINNED_LIST_SIZE (20)
 
-#define BINNED_LIST_SIZE 20
+#define END_OF_LIST 1
 
 #define MAX(x, y) ((x > y) ? x : y)
 
@@ -65,7 +63,7 @@
 //
 /* ------------------------------------------------------------------------- */
 
-size_t GET_ALL_BIN_SIZE() {
+static inline size_t GET_ALL_BIN_SIZE() {
   size_t ret = 0;
   for (int i = 0; i < BINNED_LIST_SIZE; i++) {
     ret += BIN_SIZE(i);
@@ -73,27 +71,55 @@ size_t GET_ALL_BIN_SIZE() {
   return ret;
 }
 
-void SET_BLOCK_NEXT(void *ptr, size_t next) {
+// Assume that ptr points to the beginning of the header.
+static inline void SET_BLOCK_NEXT(void *ptr, size_t next) {
   *(size_t *)ptr = next;
 }
 
-void SET_BLOCK_SIZE(void *ptr, unsigned int size) {
+static inline void SET_BLOCK_SIZE(void *ptr, size_t size) {
   char *p = (char *)ptr + SIZE_T_SIZE;
-  *(unsigned int *)p = size;
+  *(size_t *)p = size;
 }
 
-size_t GET_BLOCK_NEXT(void *ptr) {
+static inline size_t GET_BLOCK_NEXT(void *ptr) {
   return *(size_t *)ptr;
 }
 
-unsigned int GET_BLOCK_SIZE(void *ptr) {
+static inline size_t GET_BLOCK_SIZE(void *ptr) {
   char *p = (char *)ptr + SIZE_T_SIZE;
-  return *(unsigned int *)p;
+  return *(size_t *)p;
 }
+
+/* ------------------------------------------------------------------------- */
+//
+// DEBUG FUNCTIONS
+//
+/* ------------------------------------------------------------------------- */
+
+void print_lists() {
+  char *bfl = (char *)mem_heap_lo();
+
+  for (int i = 0; i < BINNED_LIST_SIZE; i++) {
+    printf("Current block size: %lu\n", BLOCK_SIZE(i));
+    size_t curr = GET_BLOCK_NEXT(bfl);
+    while(curr) {
+      printf("%zu ", curr);
+      curr = GET_BLOCK_NEXT((void *) curr);
+    }
+    bfl += SIZE_T_SIZE;
+    printf("\n");
+  }
+}
+
+/* ------------------------------------------------------------------------- */
+//
+// MANAGEMENT FUNCTIONS
+//
+/* ------------------------------------------------------------------------- */
 
 // When inceasing heap size, just add one new mem block into each bin
 void increase_heap_size() {
-  unsigned int incr = GET_ALL_BIN_SIZE();
+  size_t incr = GET_ALL_BIN_SIZE();
 
   char *p = (char *) mem_sbrk(incr);
   char *bfl = (char *) mem_heap_lo();
@@ -136,9 +162,34 @@ void *divide_block(int k, int l) {
     SET_BLOCK_NEXT((void *) mem_block, tmp);
 
     mem_block += BIN_SIZE(i);
+    bfl += SIZE_T_SIZE;
   }
   return ret;
 }
+
+void coalesce(void *ptr) {
+  char *adj = (char *) ptr + GET_BLOCK_SIZE(ptr) + HEADER_SIZE;
+
+  if (GET_BLOCK_SIZE((void *) adj) == GET_BLOCK_SIZE(ptr) &&
+      GET_BLOCK_NEXT((void *) adj) != 0) {
+    double num = MAX(0, log2(GET_BLOCK_SIZE((void *) adj) + HEADER_SIZE) - 4);
+    int result = ceil(num);
+
+    char *bfl = (char *) mem_heap_lo() + result * SIZE_T_SIZE;
+    while(GET_BLOCK_NEXT(bfl) != (size_t) adj) {
+      bfl = (char *) GET_BLOCK_NEXT(bfl);
+    }
+
+    SET_BLOCK_NEXT(bfl, GET_BLOCK_NEXT(adj));
+    SET_BLOCK_SIZE(ptr, (1 << (result + 5)) - HEADER_SIZE);
+  }
+}
+
+/* ------------------------------------------------------------------------- */
+//
+// MAIN FUNCTIONS
+//
+/* ------------------------------------------------------------------------- */
 
 // check - This checks our invariant that the size_t header before every
 // block points to either the beginning of the next block, or the end of the
@@ -152,7 +203,11 @@ int my_check() {
   p = lo;
   while(lo <= p && p < hi) {
     size = GET_BLOCK_SIZE((void *) p);
-    p += ALIGN(HEADER_SIZE + size);
+    if (((uintptr_t) p & (ALIGNMENT - 1)) != 0) {
+      printf("Alignment error at %p\n", p);
+      return -1;
+    }
+    p += HEADER_SIZE + size;
   }
 
   if (p != hi) {
@@ -178,7 +233,7 @@ int my_init() {
   char *heap_pos = (char *)p + (SIZE_T_SIZE * BINNED_LIST_SIZE);
   for (int i = 0; i < BINNED_LIST_SIZE; i++) {
     SET_BLOCK_NEXT(p, (size_t) heap_pos);
-    SET_BLOCK_NEXT((void *) heap_pos, 0);
+    SET_BLOCK_NEXT((void *) heap_pos, END_OF_LIST);
     SET_BLOCK_SIZE((void *) heap_pos, BLOCK_SIZE(i));
 
     heap_pos += BIN_SIZE(i);
@@ -191,9 +246,10 @@ int my_init() {
 
 //  malloc - Allocate a block by incrementing the brk pointer.
 //  Always allocate a block whose size is a multiple of the alignment.
+
 void* my_malloc(size_t size) {
   // Find the first bin size that can fit our size
-  double num = MAX(0, log2(size) - 3);
+  double num = MAX(0, log2(size + HEADER_SIZE) - 4);
   int result = ceil(num);
 
   // Allocate the the first block at this bin.
@@ -204,44 +260,46 @@ void* my_malloc(size_t size) {
 
   char *ptr = list;
   int j = result;
-  while(j < BINNED_LIST_SIZE && GET_BLOCK_NEXT(ptr) == 0) {
+  while(j < BINNED_LIST_SIZE && GET_BLOCK_NEXT(ptr) == END_OF_LIST) {
     ptr += SIZE_T_SIZE;
     j++;
   }
 
   if (j == BINNED_LIST_SIZE) {
     increase_heap_size();
-    j = result; // set j = i since there is now a free block at that size.
+    j = result; // set j = result since there is now a free block at that size.
   }
 
-  void *p;
+  char *p;
   if (j == result) {
     // Allocate the first block in this list
-    p = (void *) (GET_BLOCK_NEXT(list));
-    SET_BLOCK_NEXT((void *) list, GET_BLOCK_NEXT(p));
-    SET_BLOCK_NEXT(p, 0);
-    my_check();
+    p = (char *) GET_BLOCK_NEXT(list);
+    SET_BLOCK_NEXT((void *) list, GET_BLOCK_NEXT((void *) p));
+    SET_BLOCK_NEXT((void *) p, 0);
   } else {
     // break up block, then allocate the first block
     p = divide_block(result, j);
   }
 
-  /* my_check(); */
-  return p;
+  /* if (my_check() == -1) { */
+  /*   printf("Error on malloc of size %lu, with p = %p\n", size, p); */
+  /*   return NULL; */
+  /* } */
+  return p + HEADER_SIZE;
 }
 
 // Freed block is inserted back into the bfl.
 void my_free(void* ptr) {
+  char *block = (char *) ptr - HEADER_SIZE;
+  coalesce((void *) block);
 
-  // First, get the bin this block belongs to.
-  double num = log2(GET_BLOCK_SIZE(ptr));
+  double num = MAX(0, log2(GET_BLOCK_SIZE(block) + HEADER_SIZE) - 4);
   int result = ceil(num);
-  
-  char *bfl = (char *) mem_heap_lo() + (result * SIZE_T_SIZE);
-  size_t head = GET_BLOCK_NEXT((void *) bfl);
-  SET_BLOCK_NEXT((void *) bfl, (size_t) ptr);
-  SET_BLOCK_NEXT(ptr, head);
-  /* my_check(); */
+  char *bfl = (char *) mem_heap_lo() + result * SIZE_T_SIZE;
+
+  size_t tmp = GET_BLOCK_NEXT(bfl);
+  SET_BLOCK_NEXT(bfl, (size_t) block);
+  SET_BLOCK_NEXT(block, tmp);
 }
 
 // realloc - Implemented simply in terms of malloc and free
@@ -259,7 +317,7 @@ void* my_realloc(void* ptr, size_t size) {
   // where we stashed this in the SIZE_T_SIZE bytes directly before the
   // address we returned.  Now we can back up by that many bytes and read
   // the size.
-  copy_size = *(size_t*)((uint8_t*)ptr - SIZE_T_SIZE);
+  copy_size = *(size_t*)((char *)ptr - SIZE_T_SIZE);
 
   // If the new block is smaller than the old one, we have to stop copying
   // early so that we don't write off the end of the new block of memory.
