@@ -21,7 +21,7 @@ throughput of the allocator.
 
 ## Performance
 
-![](assets/imgs/performance.png)
+![](mymalloc/assets/imgs/performance.png)
 
 Above, you can compare the performance of my allocator to the libc implementation. For the simple traces provided, it does quite well,
 but there is a noticeable difference for `trace_c9_v0`. Taking a look at the trace, we notice that the user is trying to allocate many
